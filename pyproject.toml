@@ -1,6 +1,6 @@
 [project]
 name = "qnshare"
-version = "0.1.0"
+version = "0.1.1"
 description = "七牛云文件共享工具 - 一个简单易用的七牛云存储命令行工具"
 readme = "README.md"
 authors = [

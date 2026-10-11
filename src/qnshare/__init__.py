@@ -15,7 +15,7 @@ from .exceptions import (
 from .utils import pybyte, get_user_config_dir, sanitize_filename, extract_filename_from_url
 from .interactive import start_interactive_mode
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "wmymz"
 __email__ = "wmymz@icloud.com"
 
