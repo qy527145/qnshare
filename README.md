@@ -51,6 +51,9 @@ qnshare list
 # 上传文件
 qnshare upload file1.txt file2.jpg
 
+# 上传整个目录（递归，保留相对结构）
+qnshare upload photos
+
 # 下载文件
 qnshare download file1.txt
 
@@ -106,8 +109,30 @@ qnshare -i
 ### `qnshare list [--prefix PREFIX]`
 列出云端文件，可选择指定前缀过滤。
 
-### `qnshare upload FILES... [--delete-after DAYS]`
-上传一个或多个本地文件，可设置自动删除时间。
+### `qnshare upload PATHS... [--delete-after DAYS] [--recursive/--no-recursive] [--hidden/--no-hidden] [--overwrite/--skip-existing] [--force] [--refresh]`
+上传一个或多个本地文件或目录，可设置自动删除时间。
+
+- 目录**默认递归**上传，并保留相对目录结构：`qnshare upload photos` 会把 `photos/2024/b.jpg` 传成 `<prefix>photos/2024/b.jpg`。
+- 单个文件参数保持原行为，远端为 `<prefix><文件名>`。
+- 隐藏文件（`.` 开头）默认跳过，`--hidden` 可包含。
+- 云端已存在同名文件时默认**覆盖**；`--skip-existing` 改为跳过；`--force` 先删除再上传（用于重置元数据/生命周期）。
+- `--refresh` 在上传完成后刷新这些文件的CDN缓存（自动按100个一批提交）。
+
+```bash
+# 上传整个目录（含子目录，保留结构）
+qnshare upload photos
+
+# 只传目录第一层，跳过隐藏文件
+qnshare upload photos --no-recursive
+
+# 当前目录全量同步：含隐藏文件、先删后传、并刷新CDN
+qnshare upload . --hidden --force --refresh
+
+# 云端已有同名文件时跳过，不覆盖
+qnshare upload photos --skip-existing
+```
+
+只要有文件上传失败，命令退出码即为 `1`（空目录、跳过隐藏文件、CDN刷新失败都不算失败）。
 
 ### `qnshare download FILENAME [--output OUTPUT]`
 下载云端文件到本地，可指定输出文件名。
@@ -129,7 +154,7 @@ qnshare -i
 
 在交互式模式中可用的命令：
 - `l` 或 `list` - 列出文件
-- `p` 或 `upload` - 上传文件（支持文件选择对话框）
+- `p` 或 `upload` - 上传文件或目录（不带参数时弹出文件选择对话框）
 - `g <filename>` 或 `download <filename>` - 下载文件
 - `s <url>` 或 `fetch <url>` - 离线下载
 - `d <filename>` 或 `delete <filename>` - 删除文件

@@ -4,9 +4,7 @@
 提供qnshare的CLI命令
 """
 
-import os
 import sys
-from pathlib import Path
 from urllib.request import urlretrieve
 from typing import List
 
@@ -26,6 +24,9 @@ def handle_errors(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
+        except click.ClickException:
+            # click自己的异常（如UsageError）交给click处理，保留正确的退出码
+            raise
         except QnShareError as e:
             click.echo(f"错误: {e}", err=True)
             sys.exit(1)
@@ -237,27 +238,62 @@ def list(prefix: str):
 
 
 @cli.command()
-@click.argument('files', nargs=-1, required=True)
+@click.argument('paths', nargs=-1, required=True)
 @click.option('--delete-after', type=int, help='上传后自动删除的天数')
+@click.option('--recursive/--no-recursive', default=True,
+              help='目录是否递归上传（默认递归）')
+@click.option('--hidden/--no-hidden', 'include_hidden', default=False,
+              help='是否包含 . 开头的隐藏文件/目录（默认跳过）')
+@click.option('--overwrite/--skip-existing', default=True,
+              help='云端已存在同名文件时：覆盖（默认）或跳过')
+@click.option('--force', is_flag=True, default=False,
+              help='云端已存在时先删除再上传（重置元数据/生命周期）')
+@click.option('--refresh', 'refresh_cdn', is_flag=True, default=False,
+              help='上传后刷新所上传文件的CDN缓存')
 @handle_errors
-def upload(files: List[str], delete_after: int):
-    """上传本地文件"""
+def upload(paths: List[str], delete_after: int, recursive: bool,
+           include_hidden: bool, overwrite: bool, force: bool, refresh_cdn: bool):
+    """上传本地文件或目录
+
+    \b
+    目录会保留相对结构：
+      qnshare upload photos  ->  share/photos/a.jpg, share/photos/2024/b.jpg
+    单个文件保持 share/<文件名>：
+      qnshare upload a.jpg   ->  share/a.jpg
+    """
+    if force and not overwrite:
+        raise click.UsageError('--force 与 --skip-existing 不能同时使用')
+
     client = QiniuClient()
-    
-    for file_path in files:
-        if not os.path.exists(file_path):
-            click.echo(f"文件不存在: {file_path}", err=True)
-            continue
-        
-        click.echo(f"正在上传: {file_path}")
-        try:
-            remote_name = client.upload_local_file(
-                file_path, 
-                delete_after_days=delete_after
-            )
-            click.echo(f"上传成功: {remote_name}")
-        except Exception as e:
-            click.echo(f"上传失败 {file_path}: {e}", err=True)
+
+    def reporter(event: str, message: str) -> None:
+        # 失败与警告走 stderr，正常进度走 stdout
+        click.echo(message, err=event in ('failure', 'warning'))
+
+    summary = client.upload_paths(
+        paths,
+        recursive=recursive,
+        include_hidden=include_hidden,
+        overwrite=overwrite,
+        force=force,
+        refresh_cdn=refresh_cdn,
+        delete_after_days=delete_after,
+        reporter=reporter,
+    )
+
+    parts = [f"成功 {len(summary.succeeded)} 个", f"失败 {len(summary.failed)} 个"]
+    if summary.skipped:
+        parts.append(f"跳过已存在 {len(summary.skipped)} 个")
+    if summary.hidden_skipped:
+        parts.append(f"跳过隐藏文件 {summary.hidden_skipped} 个")
+    click.echo("完成: " + ", ".join(parts))
+
+    if refresh_cdn:
+        click.echo(f"CDN刷新: {summary.refresh_ok} 成功 / "
+                   f"{len(summary.refresh_failed)} 失败")
+
+    if not summary.ok:
+        sys.exit(1)
 
 
 @cli.command()

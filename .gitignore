@@ -48,9 +48,9 @@ venv.bak/
 Thumbs.db
 ehthumbs.db
 
-# Testing and development files
-test_*.py
-demo_*.py
+# Testing and development files（仅限仓库根目录的临时脚本，tests/ 下的正式测试不受影响）
+/test_*.py
+/demo_*.py
 *_SUMMARY.md
 *_summary.md
 

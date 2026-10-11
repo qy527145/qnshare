@@ -4,7 +4,6 @@
 提供类似原版qn.py的交互式命令行体验
 """
 
-import os
 import sys
 from urllib.request import urlretrieve
 from typing import Dict, Callable, Any
@@ -29,9 +28,9 @@ class InteractiveShell:
         self.commands = {
             'l': ('列出云端文件', self.list_files),
             'list': ('列出云端文件', self.list_files),
-            'p': ('上传本地文件', self.upload_files),
-            'put': ('上传本地文件', self.upload_files),
-            'upload': ('上传本地文件', self.upload_files),
+            'p': ('上传本地文件或目录', self.upload_files),
+            'put': ('上传本地文件或目录', self.upload_files),
+            'upload': ('上传本地文件或目录', self.upload_files),
             'g': ('下载文件（例如：g file.zip）', self.download_file),
             'get': ('下载文件（例如：get file.zip）', self.download_file),
             'download': ('下载文件（例如：download file.zip）', self.download_file),
@@ -135,47 +134,40 @@ class InteractiveShell:
             print(f"下载失败: {e}")
     
     def upload_files(self, *args):
-        """上传文件"""
+        """上传本地文件或目录"""
         if not self._init_client():
             return
-        
+
         if args:
-            # 如果提供了文件路径参数
-            for file_path in args:
-                self._upload_single_file(file_path)
+            # 如果提供了路径参数，文件与目录可以混传
+            paths = list(args)
         else:
             # 交互式选择文件
             try:
                 from tkinter import Tk
                 from tkinter import filedialog
-                
+
                 tk = Tk()
                 tk.withdraw()
                 file_paths = filedialog.askopenfilenames(title="选择要上传的文件")
                 tk.destroy()
-                
-                if file_paths:
-                    for file_path in file_paths:
-                        self._upload_single_file(file_path)
-                else:
+
+                if not file_paths:
                     print("未选择文件")
+                    return
+                paths = list(file_paths)
             except ImportError:
-                print("无法启动文件选择对话框，请直接指定文件路径")
-                print("用法: p <文件路径1> [文件路径2] ...")
-    
-    def _upload_single_file(self, file_path: str):
-        """上传单个文件"""
-        if not os.path.exists(file_path):
-            print(f"文件不存在: {file_path}")
-            return
-        
-        try:
-            print(f'正在上传: {file_path}')
-            remote_name = f"{self.prefix}{os.path.basename(file_path)}"
-            self.client.upload_local_file(file_path, remote_name=remote_name)
-            print(f'上传成功: {os.path.basename(file_path)}')
-        except Exception as e:
-            print(f"上传失败 {file_path}: {e}")
+                print("无法启动文件选择对话框，请直接指定文件或目录路径")
+                print("用法: p <路径1> [路径2] ...")
+                return
+
+        summary = self.client.upload_paths(
+            paths, reporter=lambda event, message: print(message))
+
+        parts = [f"成功 {len(summary.succeeded)} 个", f"失败 {len(summary.failed)} 个"]
+        if summary.hidden_skipped:
+            parts.append(f"跳过隐藏文件 {summary.hidden_skipped} 个")
+        print("完成: " + ", ".join(parts))
     
     def fetch_url_to_qiniu(self, *args):
         """离线下载"""

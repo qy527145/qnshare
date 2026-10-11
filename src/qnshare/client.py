@@ -6,17 +6,36 @@
 
 import os
 import time
-from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
+from typing import Callable, List, Dict, Any, Optional, Tuple
 
 from qiniu import Auth, BucketManager, etag, put_file, put_data
 from qiniu.services.cdn.manager import create_timestamp_anti_leech_url, CdnManager
 
 from .config import get_config
 from .exceptions import (
-    AuthenticationError, NetworkError, BucketError, 
+    AuthenticationError, NetworkError, BucketError,
     FileNotFoundError, UploadError, HashVerificationError
 )
-from .utils import extract_filename_from_url
+from .utils import extract_filename_from_url, walk_directory
+
+
+@dataclass
+class UploadSummary:
+    """一次批量上传的结果汇总"""
+    succeeded: List[Tuple[str, str]] = field(default_factory=list)   # (本地路径, 远端key)
+    failed: List[Tuple[str, str]] = field(default_factory=list)      # (本地路径, 错误信息)
+    skipped: List[Tuple[str, str]] = field(default_factory=list)     # --skip-existing 跳过的 (本地路径, 远端key)
+    warnings: List[str] = field(default_factory=list)
+    empty_dirs: List[str] = field(default_factory=list)
+    hidden_skipped: int = 0
+    refresh_ok: int = 0
+    refresh_failed: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """没有文件失败即为成功（空目录、跳过隐藏文件、CDN刷新失败都不算失败）"""
+        return not self.failed
 
 
 class QiniuClient:
@@ -114,7 +133,37 @@ class QiniuClient:
             return ret is not None
         except Exception:
             return False
-    
+
+    def stat_exact(self, file_name: str) -> bool:
+        """
+        严格判断七牛云中是否存在特定文件
+
+        与 is_exist 的区别：网络/鉴权等真实错误会抛出异常，而不是被当成「不存在」。
+        --skip-existing 与 --force 依赖这个语义，否则一次网络抖动就会导致误判。
+
+        Args:
+            file_name: 文件名
+
+        Returns:
+            存在则返回True，确认不存在则返回False
+
+        Raises:
+            NetworkError: 查询本身失败（网络、鉴权、非612错误码）
+        """
+        try:
+            ret, info = self.bucket_manager.stat(self.bucket_name, file_name)
+        except Exception as e:
+            raise NetworkError(f'查询文件失败: {e}')
+
+        if ret is not None:
+            return True
+
+        status = getattr(info, 'status_code', None)
+        # 七牛用 HTTP 612 表示「文件不存在」，这是唯一能确认不存在的信号
+        if status == 612:
+            return False
+        raise NetworkError(f'查询文件失败: HTTP {status}')
+
     def get_file_list(self, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         查询七牛云中保存的文件列表
@@ -146,23 +195,21 @@ class QiniuClient:
         Returns:
             远程文件名
         """
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f'本地文件不存在: {file_path}')
-        
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f'本地文件不存在或不是文件: {file_path}')
+
         if not remote_name:
             remote_name = f"{self.prefix}{os.path.basename(file_path)}"
-        
+
         try:
             token = self.auth.upload_token(self.bucket_name, remote_name)
             ret, _ = put_file(token, remote_name, file_path)
-            
+
             if not ret:
                 raise UploadError('上传失败')
-            
+
             # 验证文件hash
-            if ret['key'] == remote_name and ret['hash'] == etag(file_path):
-                print('文件hash验证无误')
-            else:
+            if not (ret['key'] == remote_name and ret['hash'] == etag(file_path)):
                 raise HashVerificationError('文件上传过程中损坏')
             
             # 设置自动删除
@@ -206,8 +253,123 @@ class QiniuClient:
             if isinstance(e, UploadError):
                 raise
             raise UploadError(f'上传失败: {e}')
-    
-    def fetch_url(self, url: str, remote_name: Optional[str] = None, 
+
+    def upload_paths(self, paths: List[str], recursive: bool = True,
+                     include_hidden: bool = False, overwrite: bool = True,
+                     force: bool = False, refresh_cdn: bool = False,
+                     delete_after_days: Optional[int] = None,
+                     reporter: Optional[Callable[[str, str], None]] = None
+                     ) -> UploadSummary:
+        """
+        批量上传本地路径，文件与目录可以混传
+
+        目录会保留相对结构：`qnshare upload photos` 下的 photos/2024/b.jpg
+        上传后key为 `<prefix>photos/2024/b.jpg`；单个文件参数则保持
+        `<prefix><basename>` 不变（向后兼容）。
+
+        Args:
+            paths: 本地文件或目录路径列表
+            recursive: 目录是否递归，默认True
+            include_hidden: 是否包含'.'开头的文件/目录，默认False
+            overwrite: 云端已存在时覆盖，默认True
+            force: 云端已存在时先删除再上传，用于重置元数据/生命周期
+            refresh_cdn: 上传后刷新CDN缓存
+            delete_after_days: 每个文件上传后自动删除的天数
+            reporter: 进度回调，签名为 (事件名, 消息)，事件名取值
+                      start/success/failure/skip/warning
+
+        Returns:
+            UploadSummary 汇总对象
+
+        Note:
+            单个文件的失败会被记录进 summary 而不会抛出，
+            以免一个坏文件中断整批上传；配置/初始化错误仍会正常抛出。
+        """
+        summary = UploadSummary()
+        seen: Dict[str, str] = {}   # 远端key -> 本地路径，用于批内去重
+
+        def emit(event: str, message: str) -> None:
+            if reporter:
+                reporter(event, message)
+
+        def on_skip(hidden_path: str) -> None:
+            summary.hidden_skipped += 1
+
+        for path in paths:
+            if os.path.isfile(path):
+                targets = [(path, f"{self.prefix}{os.path.basename(path)}")]
+            elif os.path.isdir(path):
+                root_name = os.path.basename(os.path.abspath(path))
+                if not root_name:
+                    summary.failed.append((path, '无法确定目录名（不能直接上传磁盘根目录）'))
+                    emit('failure', f"上传失败 {path}: 无法确定目录名")
+                    continue
+                targets = [
+                    (file_path, f"{self.prefix}{root_name}/{rel_key}")
+                    for file_path, rel_key in walk_directory(
+                        path, recursive=recursive, include_hidden=include_hidden,
+                        on_skip=on_skip)
+                ]
+                if not targets:
+                    summary.empty_dirs.append(path)
+                    emit('warning', f"目录为空（或只含隐藏文件）: {path}")
+                    continue
+            else:
+                summary.failed.append((path, '路径不存在'))
+                emit('failure', f"上传失败 {path}: 路径不存在")
+                continue
+
+            for file_path, remote_key in targets:
+                if remote_key in seen:
+                    message = (f"跳过重复的key {remote_key}"
+                               f"（已由 {seen[remote_key]} 占用）")
+                    summary.warnings.append(message)
+                    emit('warning', message)
+                    continue
+                seen[remote_key] = file_path
+
+                # 先决定「已存在」时的处理方式，再决定要不要传
+                try:
+                    if not overwrite:
+                        if self.stat_exact(remote_key):
+                            summary.skipped.append((file_path, remote_key))
+                            emit('skip', f"已存在，跳过: {remote_key}")
+                            continue
+                    elif force and self.stat_exact(remote_key):
+                        self.delete_file(remote_key)
+                except NetworkError as e:
+                    summary.failed.append((file_path, str(e)))
+                    emit('failure', f"上传失败 {file_path}: {e}")
+                    continue
+                except Exception as e:
+                    # 预删除失败不阻止上传——七牛本身就会覆盖
+                    message = f"删除已存在的 {remote_key} 失败，将直接覆盖: {e}"
+                    summary.warnings.append(message)
+                    emit('warning', message)
+
+                emit('start', f"正在上传: {file_path}")
+                try:
+                    self.upload_local_file(file_path, remote_name=remote_key,
+                                           delete_after_days=delete_after_days)
+                except Exception as e:
+                    summary.failed.append((file_path, str(e)))
+                    emit('failure', f"上传失败 {file_path}: {e}")
+                    continue
+
+                summary.succeeded.append((file_path, remote_key))
+                emit('success', f"上传成功: {remote_key}")
+
+        if refresh_cdn and summary.succeeded:
+            try:
+                summary.refresh_ok, summary.refresh_failed = self.refresh_many(
+                    [remote_key for _, remote_key in summary.succeeded])
+            except NetworkError as e:
+                summary.refresh_failed = [k for _, k in summary.succeeded]
+                summary.warnings.append(str(e))
+
+        return summary
+
+    def fetch_url(self, url: str, remote_name: Optional[str] = None,
                   delete_after_days: Optional[int] = None) -> str:
         """
         抓取网络资源，可用于离线下载
@@ -301,11 +463,55 @@ class QiniuClient:
     def refresh(self, file_name: str) -> None:
         """
         刷新七牛云CDN
-        
+
         Args:
             file_name: 文件名
+
+        Raises:
+            NetworkError: 刷新请求失败，或接口返回了错误码
         """
-        try:
-            self.cdn_manager.refresh_urls([f'http://{self.domain}/{file_name}'])
-        except Exception as e:
-            raise NetworkError(f'CDN刷新失败: {e}')
+        self.refresh_many([file_name])
+
+    def refresh_many(self, file_names: List[str], chunk_size: int = 100) -> Tuple[int, List[str]]:
+        """
+        批量刷新七牛云CDN
+
+        七牛刷新接口单次最多接受 100 个URL，这里自动分块，单块失败不影响其余块。
+
+        Args:
+            file_names: 文件名列表
+            chunk_size: 每批提交的数量
+
+        Returns:
+            (刷新成功的数量, 刷新失败的key列表)
+
+        Raises:
+            NetworkError: 全部批次都失败且没有任何成功的key
+        """
+        succeeded = 0
+        failed: List[str] = []
+
+        for start in range(0, len(file_names), chunk_size):
+            chunk = file_names[start:start + chunk_size]
+            urls = [f'http://{self.domain}/{name}' for name in chunk]
+            try:
+                ret, info = self.cdn_manager.refresh_urls(urls)
+            except Exception as e:
+                failed.extend(chunk)
+                continue
+
+            # 刷新接口出错时 HTTP 仍可能是 200，真正的错误在 body 的 code/error 里
+            body_error = None
+            if isinstance(ret, dict):
+                code = ret.get('code')
+                if code is not None and code != 200:
+                    body_error = ret.get('error') or f"code={code}"
+            if (info is None or not info.ok()) or body_error:
+                failed.extend(chunk)
+            else:
+                succeeded += len(chunk)
+
+        if failed and not succeeded:
+            raise NetworkError(f'CDN刷新失败: {len(failed)} 个文件未能刷新')
+
+        return succeeded, failed

@@ -6,7 +6,7 @@
 
 import os
 from pathlib import Path
-from typing import Union
+from typing import Callable, Iterator, Optional, Tuple, Union
 
 
 def pybyte(size: Union[int, float], is_speed: bool = False, precision: int = 2) -> str:
@@ -131,5 +131,57 @@ def extract_filename_from_url(url: str) -> str:
     
     if not filename:
         filename = 'unknown_file'
-    
+
     return sanitize_filename(filename)
+
+
+def walk_directory(root: str, recursive: bool = True, include_hidden: bool = False,
+                   on_error: Optional[Callable[[OSError], None]] = None,
+                   on_skip: Optional[Callable[[str], None]] = None
+                   ) -> Iterator[Tuple[str, str]]:
+    """
+    遍历本地目录，产出目录下的每一个文件
+
+    Args:
+        root: 要遍历的根目录
+        recursive: 是否递归子目录，默认为True
+        include_hidden: 是否包含隐藏文件/目录（'.'开头），默认为False
+        on_error: 遇到无法进入的目录时的回调，接收该OSError
+        on_skip: 因隐藏而被跳过时的回调，接收被跳过的路径
+
+    Yields:
+        (文件绝对/相对路径, 相对root的key) 元组，key一律使用'/'分隔符
+
+    Note:
+        只产出文件，不产出目录——对象存储没有真正的目录概念。
+        目录软链不会被跟进（避免成环），文件软链按其目标内容上传。
+    """
+    def _skipped(name: str) -> bool:
+        return not include_hidden and name.startswith('.')
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False,
+                                                onerror=on_error):
+        # topdown=True 时原地过滤才能真正剪掉整棵隐藏目录树
+        for name in dirnames[:]:
+            if _skipped(name):
+                dirnames.remove(name)
+                if on_skip:
+                    on_skip(os.path.join(dirpath, name))
+
+        # 排序保证顺序稳定，重复检测与输出可复现
+        dirnames.sort()
+        filenames.sort()
+
+        # 非递归时只在根目录这一层产出文件
+        if not recursive:
+            dirnames[:] = []
+
+        for name in filenames:
+            if _skipped(name):
+                if on_skip:
+                    on_skip(os.path.join(dirpath, name))
+                continue
+            file_path = os.path.join(dirpath, name)
+            # Windows下relpath返回反斜杠，必须换成'/'才能作为七牛key
+            rel_key = os.path.relpath(file_path, root).replace('\\', '/').replace(os.sep, '/')
+            yield file_path, rel_key
